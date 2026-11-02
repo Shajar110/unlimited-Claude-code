@@ -35,9 +35,12 @@ Claude does the full setup. When it's done, it tells you what to do in the OmniR
                                         └─► auto-fallback between providers
 
   Usage limit hit ─► StopFailure hook writes the flag + desktop notification
-  You type /exit ─► wrapper resumes the same chat (--continue) via OmniRoute
+  You type /exit ─► wrapper resumes the same chat (--continue) via OmniRoute,
+                    with the full chat history
   Limit resets   ─► flag expires ─► claude goes back to Anthropic
 ```
+
+- **Your chat history comes with you.** The fallback resumes the *same* conversation (`--continue`), so the OmniRoute model sees everything you and Claude discussed. Running `claude-omni` with no arguments also resumes the last chat in the current folder.
 
 - **One shared instance.** OmniRoute runs as a single systemd user service. RTK is a hook binary, not a daemon. With 2, 3 or 10 terminals running `claude`, there is still exactly one OmniRoute and no duplicate processes.
 - **Background only.** OmniRoute starts at login with `--no-open --no-tray`. No browser window, no tray icon.
@@ -182,12 +185,18 @@ OMNI_KEY=${OMNI_KEY:-omniroute-local}                 # OmniRoute API key, only 
 
 run_omni() {
   systemctl --user is-active --quiet omniroute.service || systemctl --user start omniroute.service
-  # ANTHROPIC_AUTH_TOKEN overrides the subscription login, so the OAuth token never reaches OmniRoute
+  # ANTHROPIC_AUTH_TOKEN overrides the subscription login, so the OAuth token never reaches OmniRoute.
+  # CLAUDE_CODE_AUTO_MODE_SERVER=0: auto mode uses its own classifier calls (no gateway billing notice).
   ANTHROPIC_BASE_URL=$OMNI_URL ANTHROPIC_AUTH_TOKEN=$OMNI_KEY \
   ANTHROPIC_MODEL=$OMNI_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=$OMNI_MODEL \
   ANTHROPIC_DEFAULT_SONNET_MODEL=$OMNI_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=$OMNI_MODEL \
-  CLAUDE_CODE_SUBAGENT_MODEL=$OMNI_MODEL \
+  CLAUDE_CODE_SUBAGENT_MODEL=$OMNI_MODEL CLAUDE_CODE_AUTO_MODE_SERVER=0 \
     exec "$REAL_CLAUDE" "$@"
+}
+
+# True when this folder already has a Claude conversation that --continue can pick up
+has_history() {
+  ls "$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')"/*.jsonl >/dev/null 2>&1
 }
 
 # Drop an expired fallback flag
@@ -195,11 +204,17 @@ run_omni() {
 
 case "${CLAUDE_ROUTE:-auto}" in
   direct) exec "$REAL_CLAUDE" "$@" ;;
-  omni)   run_omni "$@" ;;
+  omni)
+    # claude-omni with no args resumes this folder's last chat; `claude-omni --new` starts fresh
+    if [ "$1" = "--new" ]; then shift
+    elif [ $# -eq 0 ] && has_history; then set -- --continue
+    fi
+    run_omni "$@" ;;
 esac
 
 if [ -f "$FLAG" ]; then
   echo "⚡ Claude limit active until $(date -d @"$(cat "$FLAG")" '+%a %H:%M') → OmniRoute ($OMNI_MODEL)" >&2
+  [ $# -eq 0 ] && has_history && set -- --continue
   run_omni "$@"
 fi
 
@@ -216,21 +231,30 @@ EOF
 
 ### 4b. The limit hook: `~/.claude/fallback/on-limit.sh`
 
+It only triggers on a real usage limit: either a subscription window is at 99%+, or the error text says the limit was reached. A short-lived `429 Too Many Requests` is ignored, so it doesn't lock you into OmniRoute for hours by mistake.
+
 ```bash
 cat > ~/.claude/fallback/on-limit.sh <<'EOF'
 #!/usr/bin/env bash
-# StopFailure(rate_limit) hook: mark the OmniRoute fallback active until the limit resets.
+# StopFailure hook: when the subscription usage limit is hit, mark the OmniRoute fallback
+# active until the limit resets. Transient 429s (no limit wording, no exhausted window) are ignored.
 [ -n "$ANTHROPIC_BASE_URL" ] && exit 0   # already on OmniRoute
 D=$HOME/.claude/fallback
-reset=$(python3 -I -c 'import json,sys
+reset=$(python3 -I -c 'import json,sys,re,time
+try: d=json.load(sys.stdin)
+except Exception: d={}
+msg=" ".join(str(d.get(k) or "") for k in ("error","error_details","last_assistant_message"))
 try:
   r=json.load(open(sys.argv[1]))
   t=[w.get("resets_at",0) for w in r.values() if isinstance(w,dict) and w.get("used_percentage",0)>=99]
-  print(int(max(t)) if t else "")
-except Exception: print("")' "$D/rate_limits.json")
-[ -z "$reset" ] && reset=$(( $(date +%s) + 5*3600 ))
+except Exception: t=[]
+worded=re.search(r"usage limit|session limit|weekly limit|limit reached|hit your", msg, re.I)
+if t: print(int(max(t)))
+elif worded: print(int(time.time())+5*3600)' "$D/rate_limits.json")
+[ -z "$reset" ] && exit 0
 echo "$reset" > "$D/omni-until"
-notify-send -a Claude "Claude usage limit reached" "Type /exit — it will resume via OmniRoute until $(date -d @"$reset" '+%a %H:%M')" 2>/dev/null
+echo "$(date '+%F %T') limit hit, fallback until $(date -d @"$reset" '+%F %T')" >> "$D/limit.log"
+notify-send -a Claude "Claude usage limit reached" "Type /exit — this chat will continue via OmniRoute until $(date -d @"$reset" '+%a %H:%M')" 2>/dev/null
 exit 0
 EOF
 ```
@@ -262,7 +286,11 @@ bash -n ~/.local/bin/claude-smart && bash -n ~/.claude/fallback/on-limit.sh && e
 
 ## Step 5: Register the hooks in `~/.claude/settings.json`
 
-Back up the file, then **merge** these keys into it. Keep everything that's already there, including the RTK `PreToolUse` hook from Step 1:
+Back up the file, then **merge** these keys into it. Keep everything that's already there, including the RTK `PreToolUse` hook from Step 1.
+
+> **Why `autoContinueAtUsageLimit: false` is required:** by default, a subscription session that hits its usage limit doesn't end with an error. It just **waits** for the reset ("Continuing automatically at …"). In that case the `StopFailure` hook never fires and the fallback never starts. Turning the setting off makes the limit end the turn, so the hook can switch you to OmniRoute. The user can turn it back on in `/config` → *Continue automatically at usage limit*, but then the automatic fallback won't trigger.
+>
+> The `StopFailure` hook has **no matcher** on purpose: Claude Code's docs don't say which error type the subscription limit reports, so the script reads the error itself and decides.
 
 ```bash
 cp ~/.claude/settings.json ~/.claude/settings.json.bak 2>/dev/null
@@ -275,11 +303,12 @@ h = s.setdefault("hooks", {})
 h["SessionStart"] = [x for x in h.get("SessionStart", []) if "omniroute" not in json.dumps(x)] + [{
   "hooks": [{"type": "command",
              "command": "systemctl --user is-active --quiet omniroute.service || systemctl --user start --no-block omniroute.service; exit 0"}]}]
-# Detect the usage limit
+# Detect the usage limit (no matcher: on-limit.sh filters real limits from transient 429s)
 h["StopFailure"] = [x for x in h.get("StopFailure", []) if "on-limit.sh" not in json.dumps(x)] + [{
-  "matcher": "rate_limit",
   "hooks": [{"type": "command", "command": "~/.claude/fallback/on-limit.sh"}]}]
 s.setdefault("statusLine", {"type": "command", "command": "~/.claude/fallback/statusline.sh"})
+# End the turn at the usage limit instead of waiting, so StopFailure fires
+s["autoContinueAtUsageLimit"] = False
 json.dump(s, open(p, "w"), indent=2)
 print(json.dumps(s, indent=2))
 EOF
@@ -292,9 +321,10 @@ Final `~/.claude/settings.json` should contain at least:
   "hooks": {
     "PreToolUse":   [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "rtk hook claude" }] }],
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "systemctl --user is-active --quiet omniroute.service || systemctl --user start --no-block omniroute.service; exit 0" }] }],
-    "StopFailure":  [{ "matcher": "rate_limit", "hooks": [{ "type": "command", "command": "~/.claude/fallback/on-limit.sh" }] }]
+    "StopFailure":  [{ "hooks": [{ "type": "command", "command": "~/.claude/fallback/on-limit.sh" }] }]
   },
-  "statusLine": { "type": "command", "command": "~/.claude/fallback/statusline.sh" }
+  "statusLine": { "type": "command", "command": "~/.claude/fallback/statusline.sh" },
+  "autoContinueAtUsageLimit": false
 }
 ```
 
@@ -316,7 +346,9 @@ EOF
 |---|---|
 | `claude` | Smart: Anthropic first, OmniRoute after the limit |
 | `claude-direct` | Always Anthropic |
-| `claude-omni` | Always OmniRoute |
+| `claude-omni` | OmniRoute, **resuming the last chat in this folder** (with its history) |
+| `claude-omni --new` | OmniRoute, fresh chat |
+| `claude-omni --resume` | OmniRoute, pick any earlier chat from a list |
 | `OMNI_MODEL=auto/pro-coding claude-omni` | OmniRoute with a different combo |
 
 ## Step 7: Check whether OmniRoute needs an API key
@@ -337,10 +369,17 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | rtk hook cla
 # 2. OmniRoute service
 systemctl --user is-active omniroute.service
 
-# 3. Status line + limit hook (simulated, then cleaned up)
-echo '{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":100,"resets_at":'$(( $(date +%s)+3600 ))'}}}' | ~/.claude/fallback/statusline.sh
-env -u ANTHROPIC_BASE_URL ~/.claude/fallback/on-limit.sh && date -d @"$(cat ~/.claude/fallback/omni-until)"
-rm -f ~/.claude/fallback/omni-until ~/.claude/fallback/rate_limits.json
+# 3. Status line
+echo '{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":'$(( $(date +%s)+3600 ))'}}}' | ~/.claude/fallback/statusline.sh
+rm -f ~/.claude/fallback/rate_limits.json
+
+# 4. Limit hook: a transient 429 must NOT trigger, a usage-limit message must
+F=~/.claude/fallback
+echo '{"error":"rate_limit","error_details":"429 Too Many Requests"}' | env -u ANTHROPIC_BASE_URL $F/on-limit.sh
+[ -f $F/omni-until ] && echo "WRONG: triggered" || echo "not triggered ✓"
+echo '{"error":"rate_limit","last_assistant_message":"You have hit your session limit"}' | env -u ANTHROPIC_BASE_URL $F/on-limit.sh
+[ -f $F/omni-until ] && echo "triggered ✓ until $(date -d @$(cat $F/omni-until))" || echo "WRONG: not triggered"
+rm -f $F/omni-until $F/limit.log
 ```
 
 The **end-to-end OmniRoute test** (`claude-omni -p "Reply with exactly: fallback OK"`) only works **after the user has connected providers** (next section). Until then OmniRoute's free keyless providers usually fail with 429/402/403 errors. That's expected.
@@ -351,7 +390,16 @@ curl -s http://127.0.0.1:20128/v1/messages -H 'content-type: application/json' -
   -d '{"model":"auto/best-coding","max_tokens":30,"messages":[{"role":"user","content":"Reply with exactly: OK working"}]}'
 CLAUDE_ROUTE=omni ~/.local/bin/claude-smart -p "Reply with exactly: fallback OK"
 ```
-A warning that Claude Code *"doesn't recognize the model auto/best-coding"* is harmless.
+A warning that Claude Code *"doesn't recognize the model auto/best-coding"* is harmless. Claude Code then assumes a 200K context window.
+
+**History carry-over test.** This proves a chat started on Anthropic continues on OmniRoute with its context:
+```bash
+mkdir -p /tmp/histtest && cd /tmp/histtest
+CLAUDE_ROUTE=direct ~/.local/bin/claude-smart -p "Remember this secret word for later: PISTACHIO-42. Reply only: noted"
+CLAUDE_ROUTE=omni ~/.local/bin/claude-smart --continue -p "What secret word did I ask you to remember? Reply with only the word."
+# expected: PISTACHIO-42
+cd - >/dev/null
+```
 
 ## Step 9: Final message to the user (Claude, say this in chat)
 
@@ -374,8 +422,10 @@ When all steps above are done, tell the user the following **in their language**
 >
 > **How it works from now on**
 > - Use `claude` normally. It runs on your own Anthropic subscription.
-> - When your usage limit is hit, you get a desktop notification. Type **`/exit`** and the same conversation automatically continues through OmniRoute.
+> - When your usage limit is hit, you get a desktop notification. Type **`/exit`** and the **same conversation, with its full history**, automatically continues through OmniRoute.
 > - Until your limit resets, every new `claude` you open goes through OmniRoute. After the reset it goes back to Anthropic by itself.
+> - Want to switch manually? `claude-omni` reopens this folder's last chat on OmniRoute; `claude-omni --new` starts a fresh one.
+> - Note: at the limit Claude no longer *waits* for the reset; it hands over to OmniRoute instead. (You can change that in `/config`, but then the automatic fallback won't happen.)
 > - So your work doesn't stop when your Claude limit runs out.
 
 ---
@@ -386,7 +436,11 @@ When all steps above are done, tell the user the following **in their language**
 |---|---|
 | `Port 20128 is already in use` | Expected: the background service is already running. Don't run `omniroute` / `omniroute serve`; open http://localhost:20128 instead. |
 | OmniRoute not running | `systemctl --user restart omniroute` then `journalctl --user -u omniroute -n 50` |
-| Fallback didn't trigger when the limit hit | Type `/exit` and run `claude-omni -c` manually. Check `~/.claude/settings.json` has the `StopFailure` hook. |
+| Fallback didn't trigger when the limit hit | Check `~/.claude/settings.json` has `"autoContinueAtUsageLimit": false` and the `StopFailure` hook. Meanwhile type `/exit` and run `claude-omni` (it resumes the same chat). `~/.claude/fallback/limit.log` shows every time the hook switched you. |
+| Session shows *"Continuing automatically at …"* at the limit | `autoContinueAtUsageLimit` is still on. Set it to `false` (Step 5) or turn it off in `/config`. |
+| On OmniRoute the chat has no memory of earlier work | You started a fresh chat. Use `claude-omni` (no args) or `claude-omni --resume`, **from the same folder** as the original chat. Don't use `claude-omni --new`. |
+| Notice: *"auto mode … this session isn't eligible because your requests go through 127.0.0.1:20128"* | Harmless billing notice. The wrapper sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` in OmniRoute mode, which silences it. If you still see it, you probably started Claude through OmniRoute another way (see the next row). |
+| `/usage` is empty, or `/model` → *"Unable to determine provider for model claude-opus-5-5"* | That folder routes to OmniRoute through its own settings. Look for `ANTHROPIC_BASE_URL` in `<project>/.claude/settings.json` or `settings.local.json` and remove it (back it up first). The wrapper already handles routing, so project files must not set it. Find them with: `find ~ -path '*/.claude/settings*.json' -not -path '*/node_modules/*' 2>/dev/null \| xargs grep -l ANTHROPIC_BASE_URL` |
 | Stuck on OmniRoute after the limit reset | `rm ~/.claude/fallback/omni-until` |
 | All requests via OmniRoute fail | No working provider is connected. Connect more in the dashboard, or try another combo: `OMNI_MODEL=auto/coding claude-omni` |
 | `oauth start` says *Unknown provider* | Some providers only accept API keys (e.g. `gemini` = Google AI Studio key). Use the dashboard, or `omniroute providers available` to see each provider's auth type. |
@@ -400,14 +454,17 @@ rtk init -g --uninstall                                   # remove the RTK hook
 systemctl --user disable --now omniroute.service
 rm ~/.config/systemd/user/omniroute.service
 rm -rf ~/.claude/fallback ~/.local/bin/claude-smart
-# then remove the claude()/claude-direct()/claude-omni() lines from ~/.bashrc
-# and the SessionStart / StopFailure / statusLine entries from ~/.claude/settings.json
+# then remove the claude()/claude-direct()/claude-omni() lines from ~/.bashrc,
+# remove the SessionStart / StopFailure / statusLine entries from ~/.claude/settings.json,
+# and delete "autoContinueAtUsageLimit": false (or set it to true) to get the default wait-at-limit back
 npm uninstall -g omniroute                                # optional
 ```
 
 ## Notes & limits
 
 - A running Claude session can't switch endpoints mid-conversation, so one `/exit` is needed when the limit hits. The wrapper then resumes automatically with `--continue`.
-- Claude Code's docs do not explicitly say that the subscription "usage limit reached" error is reported as `rate_limit`. If the hook doesn't fire for you, use `claude-omni` manually.
+- `--continue` resumes the most recent chat **in the current folder**. Claude stores chats per folder (`~/.claude/projects/<folder>/`), so run `claude-omni` from the same folder you were working in.
+- Claude Code's docs do not say which error type the subscription "usage limit reached" error uses, so the hook reads the error text and the status-line usage data itself. If it ever doesn't fire for you, use `claude-omni` manually.
+- **Policy:** your Anthropic login never goes through OmniRoute. On Anthropic, Claude Code talks to Anthropic directly. On OmniRoute, it uses a separate local token. **Never connect "Claude Code (OAuth)" inside OmniRoute.**
 - Fallback models (MiniMax, Kimi, GLM, GPT, Gemini …) are capable, but their quality differs from Claude.
 - Many OmniRoute providers are other tools' subscription accounts (Cursor, Kiro, Devin, Cline, Trae, Antigravity …), not official APIs. Using them through a proxy may break those services' terms and risks those accounts. API-key providers (Groq, Mistral, OpenRouter, Moonshot, AI Studio …) are the safest choice.
